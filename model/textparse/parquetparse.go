@@ -18,11 +18,14 @@ package textparse
 
 import (
 	"bytes"
-	"fmt"
 	"io"
 	"log"
+	"strings"
+	"time"
 
-	"github.com/xitongsys/parquet-go/reader"
+	"github.com/xitongsys/parquet-go/common"
+	"github.com/xitongsys/parquet-go/parquet"
+	parquet_reader "github.com/xitongsys/parquet-go/reader"
 	"github.com/xitongsys/parquet-go/source"
 
 	"github.com/prometheus/prometheus/model/exemplar"
@@ -40,19 +43,17 @@ import (
 // }
 type ParquetBytesReader struct {
 	reader *bytes.Reader
-	b      []byte
+	buffer []byte
 }
 
 func (pr ParquetBytesReader) Open(name string) (source.ParquetFile, error) {
-	return pr, nil
+	// ParquetReader creates a separate ParquetFile for each column. Cannot re-use
+	// this ParquetBytesReader as each file reader will seek to different location
+	return ParquetBytesReader{reader: bytes.NewReader(pr.buffer)}, nil
 }
 
 func (pr ParquetBytesReader) Close() error {
 	return nil
-}
-
-func (pr ParquetBytesReader) Bytes() []byte {
-	return pr.b
 }
 
 func (pr ParquetBytesReader) Read(p []byte) (n int, err error) {
@@ -69,35 +70,91 @@ func (pr ParquetBytesReader) Seek(offset int64, whence int) (int64, error) {
 }
 
 func (pr ParquetBytesReader) Create(name string) (source.ParquetFile, error) {
+	// should never happen here
 	return pr, nil
 }
 
-func NewParquetBytesReader(b []byte) ParquetBytesReader {
-	return ParquetBytesReader{reader: bytes.NewReader(b), b: b}
+func NewParquetBytesReader(buffer []byte) ParquetBytesReader {
+	return ParquetBytesReader{reader: bytes.NewReader(buffer), buffer: buffer}
 }
 
 type ParquetParser struct {
-	r           ParquetBytesReader
-	metric_name []byte   // assume a single one per parquet file -  read from the file metadata
-	series      [][]byte // list of column/series names
-	text        []byte   //??
-	val         float64
-	ts          int64
-	// start          int
-	// offsets        []int
-	current_row    int
-	current_series int
+	reader            parquet_reader.ParquetReader
+	metric_name       []byte   // assume a single one per parquet file -  read from the file metadata
+	series            []string // list of column/series names
+	val               float64
+	ts                int64
+	current_row       int
+	total_row_count   int
+	current_series    int
+	index_column_name string
 }
 
 // NewParquetParser returns a new parser of the byte slice.
 func NewParquetParser(b []byte) Parser {
-	return &ParquetParser{r: NewParquetBytesReader(b), current_row: 0}
+	bytes_reader := NewParquetBytesReader(b)
+
+	reader, err := parquet_reader.NewParquetReader(bytes_reader, nil, 4)
+	if err != nil {
+		log.Println("Creating parquet reader failed", err)
+		// what now?
+		return &ParquetParser{}
+	}
+
+	// Extract desired data from the file footer
+	metric_name := []byte{}
+	row_count := int(reader.GetNumRows())
+	series := []string{}
+	index_column_name := ""
+
+	// Read file metadata
+	for _, v := range reader.Footer.GetKeyValueMetadata() {
+		// fmt.Println(v.Key, *(v.Value))
+		switch v.Key {
+		case "metric_name":
+			metric_name = []byte(*(v.Value))
+		case "tags":
+			// grab
+		}
+	}
+
+	// Read schema column names
+	for _, schema := range reader.Footer.GetSchema() {
+		name := schema.GetName()
+		// fmt.Println(schema.Name, schema.Type, schema.GetTypeLength(), schema.GetLogicalType())
+		switch t := schema.GetType(); t {
+		case parquet.SchemaElement_Type_DEFAULT: // think this the schema itself
+			continue
+		case parquet.Type_DOUBLE:
+			series = append(series, name)
+		case parquet.Type_INT64:
+			if strings.Contains(name, "__index_level_0__") { // should also check the LogicalType to check the timestamp units!
+				index_column_name = name
+			} else {
+				log.Println("Warning: column '", name, "' has type int64 but is not an index - this is not permitted")
+			}
+		default:
+			log.Println("Warning: column '", name, "' has unrecognised type: ", t)
+		}
+	}
+
+	if index_column_name == "" {
+		log.Println("Warning: no time index column found!")
+		return &ParquetParser{}
+	}
+
+	log.Println("INDEX", index_column_name)
+	for i, name := range series {
+		log.Println("SERIES", i, string(name))
+	}
+
+	return &ParquetParser{reader: *reader, metric_name: metric_name, current_row: 0, current_series: 0, total_row_count: row_count, series: series, index_column_name: index_column_name}
 }
 
 // Series returns the bytes of the series, the timestamp if set, and the value
 // of the current sample.
 func (p *ParquetParser) Series() ([]byte, *int64, float64) {
-	return p.series[p.current_series], &p.ts, p.val
+	return []byte(p.series[p.current_series]), &p.ts, p.val
 }
 
 // Help returns the metric name and help text in the current entry.
@@ -126,7 +183,7 @@ func (p *ParquetParser) Unit() ([]byte, []byte) {
 // Must only be called after Next returned a comment entry.
 // The returned byte slice becomes invalid after the next call to Next.
 func (p *ParquetParser) Comment() []byte {
-	return p.text
+	return nil
 }
 
 // Metric writes the labels of the current sample into the passed labels.
@@ -152,41 +209,58 @@ func (p *ParquetParser) Exemplar(e *exemplar.Exemplar) bool {
 func (p *ParquetParser) Next() (Entry, error) {
 	var err error
 
-	pr, err := reader.NewParquetReader(p.r, nil, 4)
-	if err != nil {
-		log.Println("Can't create parquet reader", err)
-		return EntryInvalid, err
-	}
-
-	num := int(pr.GetNumRows())
-
-	if p.current_row >= num {
+	if p.current_row >= p.total_row_count {
 		return EntryInvalid, io.EOF
 	}
 
-	// Read file metadata
-	for _, v := range pr.Footer.GetKeyValueMetadata() {
-		fmt.Println(v.Key, *(v.Value))
-		if v.Key == "metric_name" {
-			p.metric_name = []byte(*(v.Value))
+	// DUMB! Much better to read row group in bulk to do row-by-row
+
+	if p.current_series == 0 {
+		// Get next time stamp
+		res := make([]int64, 1)
+		err = p.reader.ReadPartial(&res, common.ReformPathStr("schema.__index_level_0__")) // p.index_column_name)) <-WHY??
+		if err != nil {
+			log.Println("Read error", err)
 		}
+		log.Println("TIME", time.Unix(0, res[0]*int64(time.Microsecond)))
+		p.ts = res[0]
 	}
 
-	// Read schema column names
-	for _, schema := range pr.Footer.GetSchema() {
-		fmt.Println(schema.Name)
-		p.series = append(p.series, []byte(schema.Name))
-	}
+	// res := make([]float64, len(p.series)+1)
+	// err = p.reader.Read(&v);
 
-	res, err := pr.ReadByNumber(p.current_row)
+	// res, err := p.reader.ReadPartialByNumber(1, common.ReformPathStr("schema.cortex_writes_gateway_rps_5xx"))
+	// num := int(p.reader.GetNumRows())
+
+	// num_rows := int(p.reader.GetNumRows())
+	// res, err := p.reader.ReadByNumber(num_rows)
+	// if err != nil {
+	// 	log.Println("Can't read", err)
+	// 	return EntryInvalid, err
+	// }
+
+	// This successfully reads an entry from 1 column at a time.
+	res := make([]float64, 1)
+	err = p.reader.ReadPartial(&res, common.ReformPathStr("schema."+strings.ToLower(p.series[p.current_series])))
+
 	if err != nil {
-		log.Println("Can't read", err)
-		return EntryInvalid, err
+		log.Println("Read error", err)
 	}
 
-	log.Println("Read", res)
+	if len(res) > 0 {
+		p.val = res[0]
+	} else {
+		p.val = 0 //???  //TODO can we distinguish NaN??
+	}
 
-	p.current_row += 1
+	log.Println("Read", p.val)
+	// return EntryInvalid, io.EOF
+
+	p.current_series += 1
+	if p.current_series == len(p.series) {
+		p.current_series = 0
+		p.current_row += 1
+	}
 
 	// for i := 0; i < num; i++ {
 	// 	stus := make([]Metric, 1)
